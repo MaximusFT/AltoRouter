@@ -2,24 +2,10 @@
 
 class AltoRouter {
 
-	/**
-	 * @var array Array of all routes (incl. named routes).
-	 */
+	private $db;
 	protected $routes = array();
-
-	/**
-	 * @var array Array of all named routes.
-	 */
 	protected $namedRoutes = array();
-
-	/**
-	 * @var string Can be used to ignore leading part of the Request URL (if main file lives in subdirectory of host)
-	 */
 	protected $basePath = '';
-
-	/**
-	 * @var array Array of default match types (regex helpers)
-	 */
 	protected $matchTypes = array(
 		'i'  => '[0-9]++',
 		'a'  => '[0-9A-Za-z]++',
@@ -40,8 +26,9 @@ class AltoRouter {
 		$this->addRoutes($routes);
 		$this->setBasePath($basePath);
 		$this->addMatchTypes($matchTypes);
+		$this->db = new medoo();
 	}
-	
+
 	/**
 	 * Retrieves all routes.
 	 * Useful if you want to process or display routes.
@@ -61,7 +48,6 @@ class AltoRouter {
 	 * @param array $routes
 	 * @return void
 	 * @author Koen Punt
-	 * @throws Exception
 	 */
 	public function addRoutes($routes){
 		if(!is_array($routes) && !$routes instanceof Traversable) {
@@ -78,6 +64,8 @@ class AltoRouter {
 	 */
 	public function setBasePath($basePath) {
 		$this->basePath = $basePath;
+		$this->lang = substr($basePath, 1);
+		// echo '<pre>'; print_r($this->lang); echo '</pre>';
 	}
 
 	/**
@@ -96,11 +84,10 @@ class AltoRouter {
 	 * @param string $route The route regex, custom regex must start with an @. You can use multiple pre-set regex filters, like [i:id]
 	 * @param mixed $target The target where this route should point to. Can be anything.
 	 * @param string $name Optional name of this route. Supply if you want to reverse route this url in your application.
-	 * @throws Exception
 	 */
-	public function map($method, $route, $target, $name = null) {
+	public function map($method, $route, $target, $name = null, $id = null, $type = 'view') {
 
-		$this->routes[] = array($method, $route, $target, $name);
+		$this->routes[] = array($method, $route, $target, $name, $id, $type);
 
 		if($name) {
 			if(isset($this->namedRoutes[$name])) {
@@ -122,7 +109,6 @@ class AltoRouter {
 	 * @param string $routeName The name of the route.
 	 * @param array @params Associative array of parameters to replace placeholders with.
 	 * @return string The URL of the route with named parameters in place.
-	 * @throws Exception
 	 */
 	public function generate($routeName, array $params = array()) {
 
@@ -133,7 +119,7 @@ class AltoRouter {
 
 		// Replace named parameters
 		$route = $this->namedRoutes[$routeName];
-		
+
 		// prepend base path to route url again
 		$url = $this->basePath . $route;
 
@@ -169,6 +155,7 @@ class AltoRouter {
 
 		$params = array();
 		$match = false;
+		$notLng = false;
 
 		// set Request Url if it isn't passed as parameter
 		if($requestUrl === null) {
@@ -176,7 +163,12 @@ class AltoRouter {
 		}
 
 		// strip base path from request url
-		$requestUrl = substr($requestUrl, strlen($this->basePath));
+		$pos2 = stripos($requestUrl, $this->basePath);
+		if ($pos2 !== false) {
+			$requestUrl = substr($requestUrl, strlen($this->basePath));
+		} else {
+			$notLng = true;
+		}
 
 		// Strip query string (?a=b) from Request Url
 		if (($strpos = strpos($requestUrl, '?')) !== false) {
@@ -188,8 +180,12 @@ class AltoRouter {
 			$requestMethod = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET';
 		}
 
+		// Force request_order to be GP
+		// http://www.mail-archive.com/internals@lists.php.net/msg33119.html
+		$_REQUEST = array_merge($_GET, $_POST);
+
 		foreach($this->routes as $handler) {
-			list($method, $_route, $target, $name) = $handler;
+			list($method, $_route, $target, $name, $id, $fileType) = $handler;
 
 			$methods = explode('|', $method);
 			$method_match = false;
@@ -242,6 +238,11 @@ class AltoRouter {
 			}
 
 			if(($match == true || $match > 0)) {
+				if ($notLng == true) {
+					return [
+						'header' => 301,
+					];
+				}
 
 				if($params) {
 					foreach($params as $key => $value) {
@@ -249,14 +250,72 @@ class AltoRouter {
 					}
 				}
 
-				return array(
+				$resMenus = $this->db->select("menutype", '*');
+				foreach ($resMenus as $key => $value) {
+					$qTmp = $this->db->select("menu", '*', [
+						"AND" => [
+							"menutype_id"=>$value['id'],
+							"lang"=>$this->lang,
+							"level"=>1,
+							"published" => 1
+							],
+						"ORDER" => ['pos ASC']
+					]);
+					$Menus[$value['name']] = $qTmp;
+				}
+				$resMenu = $this->db->get("menu", '*', [
+					"AND" => [
+						"id"=>$id,
+						"published" => 1
+						]
+					]
+				);
+
+				$resMenu['extension'] = $this->db->get("extension", '*', ["id"=>$resMenu['extension_id']]);
+
+				$resMenu['extension']['params'] = json_decode($resMenu['extension']['params']);
+				$resContent = $this->db->get("content", '*', [
+					"id" => $resMenu['link_id']
+				]);
+
+				$resSnippet = $this->db->select("extension", '*', ["AND"=>["type" => "snippet","enabled"=>"1"]]);
+
+				foreach ($resSnippet as $snippet) {
+
+					$resContent['full_text'] = str_replace("{{".$snippet['fileName']."}}","<script>".$snippet['params']."</script>", $resContent['full_text']);
+
+				}
+
+				return [
 					'target' => $target,
 					'params' => $params,
-					'name' => $name
-				);
+					'name' => $name,
+					'fileType' => $fileType,
+					'qMenuCurr' => $resMenu,
+					'qCont' => $resContent,
+					'qContId' => $resMenu['link_id'],
+					'qMenus' => $Menus,
+				];
 			}
 		}
-		return false;
+		$resMenus = $this->db->select("menutype", '*');
+		foreach ($resMenus as $key => $value) {
+			$qTmp = $this->db->select("menu", '*', [
+				"AND" => [
+					"menutype_id"=>$value['id'],
+					"lang"=>$this->lang,
+					"level"=>1,
+					"published" => 1
+					],
+				"ORDER" => ['pos ASC']
+				]
+			);
+			$Menus[$value['name']] = $qTmp;
+		}
+
+		return [
+			'qMenus' => $Menus,
+		];
 	}
 
 	/**
@@ -291,4 +350,20 @@ class AltoRouter {
 		}
 		return "`^$route$`u";
 	}
+
+	public function mapdb() {
+		$res = $this->db->select("menu", '*', [
+			"AND" => [
+				"lang"=>$this->lang,
+				"published" => 1
+				]
+			]
+		);
+	    foreach ($res as $value) {
+			$this->routes[] = [$value['method'], $value['path'], $value['function'], '', $value['id'], 'view'];
+	    }
+
+		return;
+	}
+
 }
